@@ -172,3 +172,109 @@ def getOrElseUpdate[T](
   }
 }
 ```
+
+### Checkpoint处理
+
+用户可以通过`RDD#checkpoint()`来对RDD进行检查点标记，此操作需要设置检查点的存储目录（通过`SparkContext#checkpointDir`方法）。
+
+在Spark内部，通过如下方法可以看到，在Job运行最后会通过`doCheckpoint()`方法来执行检查点相关的操作。`runJob`会触发动作（action）操作。
+```scala
+/**
+ * Run a function on a given set of partitions in an RDD and pass the results to the given
+ * handler function. This is the main entry point for all actions in Spark.
+ */
+def runJob[T, U: ClassTag](
+    rdd: RDD[T],
+    func: (TaskContext, Iterator[T]) => U,
+    partitions: Seq[Int],
+    resultHandler: (Int, U) => Unit): Unit = {
+  ...
+  dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
+  progressBar.foreach(_.finishAll())
+  rdd.doCheckpoint()
+}
+```
+从如下代码可以看到，需要先检查`checkpointData`是否为空，如果不空，`RDD#doCheckpoint()`委托给`checkpointData`去做检查点的实际操作。
+```scala
+/**
+ * Performs the checkpointing of this RDD by saving this. It is called after a job using this RDD
+ * has completed (therefore the RDD has been materialized and potentially stored in memory).
+ * doCheckpoint() is called recursively on the parent RDDs.
+ */
+private[spark] def doCheckpoint(): Unit = {
+  RDDOperationScope.withScope(sc, "checkpoint", allowNesting = false, ignoreParent = true) {
+    if (!doCheckpointCalled) {
+      doCheckpointCalled = true
+      if (checkpointData.isDefined) {
+        if (checkpointAllMarkedAncestors) {
+          dependencies.foreach(_.rdd.doCheckpoint())
+        }
+        checkpointData.get.checkpoint()
+      } else {
+        dependencies.foreach(_.rdd.doCheckpoint())
+      }
+    }
+  }
+}
+```
+那checkPointData是什么呢？我们通过看他的定义
+```scala
+private[spark] var checkpointData: Option[RDDCheckpointData[T]] = None
+```
+进一步看Ta的数据结构`RDDCheckpointData`，代码如下：
+```scala
+/**
+ * This class contains all the information related to RDD checkpointing. Each instance of this
+ * class is associated with an RDD. It manages process of checkpointing of the associated RDD,
+ * as well as, manages the post-checkpoint state by providing the updated partitions,
+ * iterator and preferred locations of the checkpointed RDD.
+ */
+private[spark] abstract class RDDCheckpointData[T: ClassTag](@transient private val rdd: RDD[T])
+  extends Serializable {
+  import CheckpointState._
+  /** 对应RDD的checkpoint状态 */
+  protected var cpState = Initialized
+
+  /** 被 Checkpoint 的 RDD 的数据 */
+  private var cpRDD: Option[CheckpointRDD[T]] = None
+
+  /** 返回RDD是否被持久化 */
+  def isCheckpointed: Boolean = RDDCheckpointData.synchronized { cpState == Checkpointed }
+  
+  /**
+   * 计算该RDD并持久化其内容。该方法在该RDD第一次动作操作后会立即被调用
+   */
+  final def checkpoint(): Unit = {
+    //确保在多线程调用该方法时只有一个线程执行后续操作
+    RDDCheckpointData.synchronized {
+      if (cpState == Initialized) {
+        cpState = CheckpointingInProgress
+      } else {
+        return
+      }
+    }
+    val newRDD = doCheckpoint()
+    // Update our state and truncate the RDD lineage
+    // 可以看到 cpRDD 在此处被赋值，通过 newRDD 来生成，而生成的方法是 doCheckpoint()
+    RDDCheckpointData.synchronized {
+      cpRDD = Some(newRDD)
+      cpState = Checkpointed
+      rdd.markCheckpointed()
+    }
+  }
+
+  /** 这个是 Checkpoint RDD 的抽象方法， 具体操作由子类实现 */
+  protected def doCheckpoint(): CheckpointRDD[T]
+  
+  /** 返回RDD数据，只有checkpointed状态才返回非空 */
+  def checkpointRDD: Option[CheckpointRDD[T]] = RDDCheckpointData.synchronized { cpRDD }
+  
+  /** 测试使用 */
+  def getPartitions: Array[Partition] = RDDCheckpointData.synchronized {
+    cpRDD.map(_.partitions).getOrElse { Array.empty }
+  }
+}
+```
+RDDCheckpointData包含了RDD的checkpoint的全部信息和相关操作，控制RDD的checkpoint过程和状态变更。
+下面我们通过类图来展示SPark中两种RDD的实现：
+![RDD UML](https://user-images.githubusercontent.com/6768613/91720677-1830e480-ebca-11ea-8881-69158e6b6ca5.png)
