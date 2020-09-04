@@ -42,136 +42,46 @@ val File = sc.textFile(filePath)
 
 ## 缓存 & 检查点
 Spark速度非常快的原因之一，就是在不同操作中在内存中持久化（或缓存）一个数据集。
-当持久化一个RDD后，每一个节点都将把计算的分片结果保存在内存中，并在对此数据集（或者衍生出的数据集）进行的其他动作（action）中重用。更多请参见[缓存的处理](#缓存的处理)。
+当持久化一个RDD后，每一个节点都将把计算的分片结果保存在内存中，并在对此数据集（或者衍生出的数据集）进行的其他动作（action）中重用。
 
 通过缓存，Spark避免了RDD上的重复计算，能够极大地提升计算速度。但是，如果缓存丢失了，则需要重新计算。如果计算特别复杂或者计算耗时特别多，那么缓存丢失对于整个Job的影响是不容忽视的。为了避免缓存丢失重新计算带来的开销，Spark又引入了检查点（checkpoint）机制。当某个点某个executor宕了，上面缓存的RDD就会丢掉， 如果没有检查点，则需要通过依赖链重新计算出来。检查点通过把RDD保存在HDFS（或用户定义的存储级别）中，在丢失时从中复制出来，实现的高容错。
 
 ![checkpoint](https://upload-images.jianshu.io/upload_images/9193428-676ecfe7baf991b0.png?imageMogr2/auto-orient/strip|imageView2/2/w/788/format/webp)
 
-## DAG生成
-将RDD连接起来，表明先后执行顺序。
+### RDD持久化
 
-- 血统(Lineage)：这个概念表明RDD之间的依赖关系（RDD的Parent）。
-- Stage：这个概念实际就是根据DAG的划分而来的。
-  - 窄依赖：由于Partition依赖关系确定，Partition的转换可以在同一个线程完成，这些RDD被划分为同一个Stage。Stage内部每个Partition被分配一个计算任务（Task），这些Task可以并行执行。
-  - 宽依赖：由于Shuffle的存在，宽依赖成为不同Stage划分的依据。Parent Stage执行全部完成后，子Stage才能执行。
-  
-  ![wordcountRDD转换](https://user-images.githubusercontent.com/6768613/91627052-f88d9680-e9e6-11ea-9fb3-5cb16cf5404e.jpeg)
+用户可以在自己可控的RDD（有些计算过程的中间RDD，在用户程序上是无法控制的）使用`RDD#cache()`或者`RDD#persist()`函数进行缓存。前者是将RDD缓存在内存中，后者需要指定缓存存储级别。
 
-
-## RDD计算
-
-### Task
-
-集群的计算节点Excutor会在准备好Task的运行环境后， 会用过调用`org.apache.spark.executor.Executor.TaskRunner#run`函数来执行。
-运行环境信息由SparkEnv包含，在新SparkContext时创建，其中有
-- **akka.actor.ActorSystem**
-  - Driver上称为sparkDriver
-  - Excutor上称为sparkExecutor
-- **org.apache.spark.serializer.Serializer**：序列化器
-- **org.apache.spark.MapOutputTracker**：保存ShuffleMapTask的输出位置信息
-  - Driver上Tracer：org.apache.spark.MapOutputTrackerMaster
-  - Executor上Tracer：org.apache.spark.MapOutputTrackerWorker，从Master上获取信息
-- **org.apache.spark.shuffle.ShuffleManager**：内置支持HashBasedShuffle和SortBasedShuffle
-  - Driver端：注册Shuffle信息
-  - Executor端：上报和获取Shuffle信息
-- **org.apache.spark.broadcast.BroadcastManager**：管理广播变量
-- **org.apache.spark.network.BlockTransferService**：Executor读取Shuffle数据的客户端，当前支持Netty和NIO
-- **org.apache.spark.storage.BlockManager**：Storage模块与其他模块的交互接口，管理Storage模块
-- **org.apache.spark.SecurityManager**：管理认证和授权
-- **org.apache.spark.HttpFileServer**：提供Http服务的Server类，当前用于Executor端下载依赖。
-- **org.apache.spark.metrics.MetricsSystem**：搜集统计信息
-- **org.apache.spark.shuffle.ShuffleMemoryManager**：管理Shuffle过程中使用的内存。
-  - 管理策略：为了使得每个线程都会比较公平地获取内存资源，避免一个线程申请了大量内存后造成其他的线程需要频繁地进行spill（把内存缓冲区中的数据写入到本地磁盘）操作。对于N个线程，每个线程可以至少申请1/(2\*N)的内存，但是至多申请1/N。
-  
-### 缓存的处理
-
-通过RDD的ID和当前计算的PartitionID向Storage模块的BlockManager发起查询请求，如果能够获得Block信息，会直接返回Block的信息。否则，代表该RDD是需要计算的。在计算结束后，计算结果会根据用户定义的存储级别，写入BlockManager中，以便下次直接读取该结果。
-
-其逻辑在如下函数中实现
-```scala  
-     
-//RDD.scala     
-/**
- * Gets or computes an RDD partition. Used by RDD.iterator() when an RDD is cached.
- */
-private[spark] def getOrCompute(partition: Partition, context: TaskContext): Iterator[T] = {
-    //由RDD Id和partitionId确认唯一的一个blockId
-    //RDD 的每个 Partition 唯一对应一个 Block（BlockId 的格式为 rdd_RDD-ID_PARTITION-ID ）
-    val blockId = RDDBlockId(id, partition.index)
-    var readCachedBlock = true
-    
-    //向BlockManager查询结果，如果有缓存，直接读取，否则计算后进行持久化存储。
-    SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
-      readCachedBlock = false
-      computeOrReadCheckpoint(partition, context)
-    }) match {
-      //持久化成功
-      case Left(blockResult) =>
-        //从Cache中读取成功
-        if (readCachedBlock) {
-          val existingMetrics = context.taskMetrics().inputMetrics
-          existingMetrics.incBytesRead(blockResult.bytes)
-          new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
-            override def next(): T = {
-              existingMetrics.incRecordsRead(1)
-              delegate.next()
-            }
-          }
-        } else {
-          new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
-        }
-      //持久化失败
-      case Right(iter) =>
-        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
-    }
-}
-
-// BlockManager.scala
-/**
- * Retrieve the given block if it exists, otherwise call the provided `makeIterator` method
- * to compute the block, persist it, and return its values.
- *
- * @return either a BlockResult if the block was successfully cached, or an iterator if the block
- *         could not be cached.
- */
-def getOrElseUpdate[T](
-    blockId: BlockId,
-    level: StorageLevel,
-    classTag: ClassTag[T],
-    makeIterator: () => Iterator[T]): Either[BlockResult, Iterator[T]] = {
-  // Attempt to read the block from local or remote storage. If it's present, then we don't need
-  // to go through the local-get-or-put path.
-  get[T](blockId)(classTag) match {
-    case Some(block) =>
-      return Left(block)
-    case _ =>
-      // Need to compute the block.
-  }
-  // Initially we hold no locks on this block.
-  doPutIterator(blockId, makeIterator, level, classTag, keepReadLock = true) match {
-    case None =>
-      // doPut() didn't hand work back to us, so the block already existed or was successfully
-      // stored. Therefore, we now hold a read lock on the block.
-      val blockResult = getLocalValues(blockId).getOrElse {
-        // Since we held a read lock between the doPut() and get() calls, the block should not
-        // have been evicted, so get() not returning the block indicates some internal error.
-        releaseLock(blockId)
-        throw new SparkException(s"get() failed for block $blockId even though we held a lock")
-      }
-      // We already hold a read lock on the block from the doPut() call and getLocalValues()
-      // acquires the lock again, so we need to call releaseLock() here so that the net number
-      // of lock acquisitions is 1 (since the caller will only call release() once).
-      releaseLock(blockId)
-      Left(blockResult)
-    case Some(iter) =>
-      // The put failed, likely because the data was too large to fit in memory and could not be
-      // dropped to disk. Therefore, we need to pass the input iterator back to the caller so
-      // that they can decide what to do with the values (e.g. process them without caching).
-     Right(iter)
-  }
-}
+存储级别由`StorageLevel`定义，它由五个维度来组成：
+```scala
+class StorageLevel private(
+    private var _useDisk: Boolean,
+    private var _useMemory: Boolean,
+    private var _useOffHeap: Boolean,
+    private var _deserialized: Boolean, // True表示以原始数据存储而非序列化后字节流
+    private var _replication: Int = 1)  //
+  extends Externalizable  {}
 ```
+根据不同的组合，Spark给出了不同的存储级别:
+```scala
+object StorageLevel {
+  val NONE = new StorageLevel(false, false, false, false)
+  val DISK_ONLY = new StorageLevel(true, false, false, false)
+  val DISK_ONLY_2 = new StorageLevel(true, false, false, false, 2)
+  val MEMORY_ONLY = new StorageLevel(false, true, false, true)
+  val MEMORY_ONLY_2 = new StorageLevel(false, true, false, true, 2)
+  val MEMORY_ONLY_SER = new StorageLevel(false, true, false, false)
+  val MEMORY_ONLY_SER_2 = new StorageLevel(false, true, false, false, 2)
+  val MEMORY_AND_DISK = new StorageLevel(true, true, false, true)
+  val MEMORY_AND_DISK_2 = new StorageLevel(true, true, false, true, 2)
+  val MEMORY_AND_DISK_SER = new StorageLevel(true, true, false, false)
+  val MEMORY_AND_DISK_SER_2 = new StorageLevel(true, true, false, false, 2)
+  val OFF_HEAP = new StorageLevel(true, true, true, false, 1)
+  }
+```
+Spark自身也会对计算结果进行缓存。在第一次动作操作计算后，RDD会自动缓存到内存中。
+
+> 这部分源码分析待添加。
 
 ### Checkpoint处理
 
@@ -275,6 +185,142 @@ private[spark] abstract class RDDCheckpointData[T: ClassTag](@transient private 
   }
 }
 ```
-RDDCheckpointData包含了RDD的checkpoint的全部信息和相关操作，控制RDD的checkpoint过程和状态变更。
+`RDDCheckpointData`包含了RDD的checkpoint的全部信息和相关操作，控制RDD的checkpoint过程和状态变更。
 下面我们通过类图来展示SPark中两种RDD的实现：
 ![RDD UML](https://user-images.githubusercontent.com/6768613/91720677-1830e480-ebca-11ea-8881-69158e6b6ca5.png)
+
+Checkpoint RDD目前有两种实现
+	1. `ReliableCheckpointRDD`：与之对应是`ReliableRDDCheckpointData`。Reliable 很好理解，就是把 RDD Checkpoint 到可依赖的文件系统，言下之意就是 Driver 重启的时候也可以从失败的时间点进行恢复，无需再走一次 RDD 的转换过程。其`writePartitionToCheckPointFile()`和`readCheckpointFile()`分别是从检查点写入文件和恢复的方法。
+	2. `LocalCheckpointRDD`：与之对应是`LocalRDDCheckpointData`。RDD 会被保存到 Executor 本地文件系统中，以减少保存到分布式容错性文件系统的巨额开销，因此 Local 形式的 Checkpoint 是基于本地持久化来做的，没有写到外部分布式文件系统。如果本地Executor挂了，那这个RDD就丢失了。`LocalCheckpointRDD`只是相当于一个占位符，本身并没有什么方法，因为其内容已经默认Cache到本地，无需其他操作。
+
+> RDD 在生成检查点时，其血统会被移除，即其前向依赖，这个我研究一下之后再补充这一块。
+
+### RDD缓存读取
+
+通过RDD的ID和当前计算的PartitionID向Storage模块的BlockManager发起查询请求，如果能够获得Block信息，会直接返回Block的信息。否则，代表该RDD是需要计算的。在计算结束后，计算结果会根据用户定义的存储级别，写入BlockManager中，以便下次直接读取该结果。
+
+其逻辑在如下函数中实现
+```scala  
+     
+//RDD.scala     
+/**
+ * Gets or computes an RDD partition. Used by RDD.iterator() when an RDD is cached.
+ */
+private[spark] def getOrCompute(partition: Partition, context: TaskContext): Iterator[T] = {
+    //由RDD Id和partitionId确认唯一的一个blockId
+    //RDD 的每个 Partition 唯一对应一个 Block（BlockId 的格式为 rdd_RDD-ID_PARTITION-ID ）
+    val blockId = RDDBlockId(id, partition.index)
+    var readCachedBlock = true
+    
+    //向BlockManager查询结果，如果有缓存，直接读取，否则计算后进行持久化存储。
+    SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
+      readCachedBlock = false
+      computeOrReadCheckpoint(partition, context)
+    }) match {
+      //持久化成功
+      case Left(blockResult) =>
+        //从Cache中读取成功
+        if (readCachedBlock) {
+          val existingMetrics = context.taskMetrics().inputMetrics
+          existingMetrics.incBytesRead(blockResult.bytes)
+          new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
+            override def next(): T = {
+              existingMetrics.incRecordsRead(1)
+              delegate.next()
+            }
+          }
+        } else {
+          new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
+        }
+      //持久化失败
+      case Right(iter) =>
+        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+    }
+}
+
+// BlockManager.scala
+/**
+ * Retrieve the given block if it exists, otherwise call the provided `makeIterator` method
+ * to compute the block, persist it, and return its values.
+ *
+ * @return either a BlockResult if the block was successfully cached, or an iterator if the block
+ *         could not be cached.
+ */
+def getOrElseUpdate[T](
+    blockId: BlockId,
+    level: StorageLevel,
+    classTag: ClassTag[T],
+    makeIterator: () => Iterator[T]): Either[BlockResult, Iterator[T]] = {
+  // Attempt to read the block from local or remote storage. If it's present, then we don't need
+  // to go through the local-get-or-put path.
+  get[T](blockId)(classTag) match {
+    case Some(block) =>
+      return Left(block)
+    case _ =>
+      // Need to compute the block.
+  }
+  // Initially we hold no locks on this block.
+  doPutIterator(blockId, makeIterator, level, classTag, keepReadLock = true) match {
+    case None =>
+      // doPut() didn't hand work back to us, so the block already existed or was successfully
+      // stored. Therefore, we now hold a read lock on the block.
+      val blockResult = getLocalValues(blockId).getOrElse {
+        // Since we held a read lock between the doPut() and get() calls, the block should not
+        // have been evicted, so get() not returning the block indicates some internal error.
+        releaseLock(blockId)
+        throw new SparkException(s"get() failed for block $blockId even though we held a lock")
+      }
+      // We already hold a read lock on the block from the doPut() call and getLocalValues()
+      // acquires the lock again, so we need to call releaseLock() here so that the net number
+      // of lock acquisitions is 1 (since the caller will only call release() once).
+      releaseLock(blockId)
+      Left(blockResult)
+    case Some(iter) =>
+      // The put failed, likely because the data was too large to fit in memory and could not be
+      // dropped to disk. Therefore, we need to pass the input iterator back to the caller so
+      // that they can decide what to do with the values (e.g. process them without caching).
+     Right(iter)
+  }
+}
+```
+
+## DAG生成
+将RDD连接起来，表明先后执行顺序。
+
+- 血统(Lineage)：这个概念表明RDD之间的依赖关系（RDD的Parent）。
+- Stage：这个概念实际就是根据DAG的划分而来的。
+  - 窄依赖：由于Partition依赖关系确定，Partition的转换可以在同一个线程完成，这些RDD被划分为同一个Stage。Stage内部每个Partition被分配一个计算任务（Task），这些Task可以并行执行。
+  - 宽依赖：由于Shuffle的存在，宽依赖成为不同Stage划分的依据。Parent Stage执行全部完成后，子Stage才能执行。
+  
+  ![wordcountRDD转换](https://user-images.githubusercontent.com/6768613/91627052-f88d9680-e9e6-11ea-9fb3-5cb16cf5404e.jpeg)
+
+
+## RDD计算
+
+### Task
+
+集群的计算节点Excutor会在准备好Task的运行环境后， 会用过调用`org.apache.spark.executor.Executor.TaskRunner#run`函数来执行。
+运行环境信息由SparkEnv包含，在新SparkContext时创建，其中有
+- **akka.actor.ActorSystem**
+  - Driver上称为sparkDriver
+  - Excutor上称为sparkExecutor
+- **org.apache.spark.serializer.Serializer**：序列化器
+- **org.apache.spark.MapOutputTracker**：保存ShuffleMapTask的输出位置信息
+  - Driver上Tracer：org.apache.spark.MapOutputTrackerMaster
+  - Executor上Tracer：org.apache.spark.MapOutputTrackerWorker，从Master上获取信息
+- **org.apache.spark.shuffle.ShuffleManager**：内置支持HashBasedShuffle和SortBasedShuffle
+  - Driver端：注册Shuffle信息
+  - Executor端：上报和获取Shuffle信息
+- **org.apache.spark.broadcast.BroadcastManager**：管理广播变量
+- **org.apache.spark.network.BlockTransferService**：Executor读取Shuffle数据的客户端，当前支持Netty和NIO
+- **org.apache.spark.storage.BlockManager**：Storage模块与其他模块的交互接口，管理Storage模块
+- **org.apache.spark.SecurityManager**：管理认证和授权
+- **org.apache.spark.HttpFileServer**：提供Http服务的Server类，当前用于Executor端下载依赖。
+- **org.apache.spark.metrics.MetricsSystem**：搜集统计信息
+- **org.apache.spark.shuffle.ShuffleMemoryManager**：管理Shuffle过程中使用的内存。
+  - 管理策略：为了使得每个线程都会比较公平地获取内存资源，避免一个线程申请了大量内存后造成其他的线程需要频繁地进行spill（把内存缓冲区中的数据写入到本地磁盘）操作。对于N个线程，每个线程可以至少申请1/(2\*N)的内存，但是至多申请1/N。
+  
+
+
+
+
